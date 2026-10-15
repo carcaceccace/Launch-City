@@ -1,0 +1,477 @@
+const BASE_WIDTH = 1000, BASE_HEIGHT = 600;
+const GRAVITY = 0.40, SKY_LIMIT = 30;
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+// ---------- assets (optional; fall back to shapes if missing) ----------
+function loadImg(src) {
+  const img = new Image();
+  img.ok = false;
+  img.onload = () => { img.ok = true; };
+  img.onerror = () => { img.ok = false; };
+  img.src = src;
+  return img;
+}
+const bgImg = loadImg("background.png");
+const buildingImg = loadImg("building.png");
+
+// mass, color, name, slide, sprite base name
+const roster = [
+  [1.0, "#ff3f34", "Arachne (1.0kg)", 0.0,  "small"],
+  [2.5, "#05c46b", "Nemesis (2.5kg)", 0.72, "medium"],
+  [5.0, "#34e7e4", "Dango (5.0kg)",   0.50, "large"],
+];
+const spriteCache = {};
+function getSprites(base) {
+  if (!spriteCache[base]) {
+    spriteCache[base] = {
+      idle: loadImg(base + "_idle.png"),
+      launched: loadImg(base + "_launched.png"),
+      landed: loadImg(base + "_landed.png"),
+    };
+  }
+  return spriteCache[base];
+}
+
+// ---------- state ----------
+let gameState = "MENU";
+let highScores = [];
+let cameraScroll = 0, targetScroll = 0;
+let aiming = false, mx = 0, my = 0;
+let score = 0, currentBuildingIdx = 0, currentForce = 0;
+let buildings = [];
+let charIdx = 0, charMass, charColor, charName, charSlide, charSprites, charRadius;
+let charX, charY, charVx = 0, charVy = 0, isLaunched = false, isSliding = false;
+let sw = 0, sh = 0;
+// predict mode
+let predictMode = false, lives = 3, restX = 0, predictRight = false, toast = null;
+const PREDICT_ANGLES = [45, 50, 55, 60, 65, 70, 75, 80];  // degrees; 45 unless the round needs steeper
+let roundCache = null;
+const ACTIVE_AHEAD = 1;  // buildings you can land on beyond the current one (1 = current + next only)
+const PERFECT_TOLERANCE = 0.04;        // within 4% of ideal speed = double points
+const panel = document.getElementById("panel"), infoEl = document.getElementById("info"),
+      valEl = document.getElementById("val"), spdEl = document.getElementById("spd"),
+      forceEl = document.getElementById("forceLine");
+document.getElementById("go").addEventListener("click", () => predictLaunch());
+
+function lbKey() { return predictMode ? "high_scores_predict" : "high_scores"; }
+function loadLeaderboard() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(lbKey()) || "[]");
+    highScores = raw.filter(Number.isInteger);
+  } catch (e) { highScores = []; }
+  highScores.sort((a, b) => b - a);
+  highScores = highScores.slice(0, 5);
+}
+function saveScore() {
+  highScores.push(score);
+  highScores.sort((a, b) => b - a);
+  highScores = highScores.slice(0, 5);
+  try { localStorage.setItem(lbKey(), JSON.stringify(highScores)); } catch (e) {}
+}
+const randInt = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
+
+function setupBuildings() {
+  buildings = [{ x: 80, y: 420, w: 140, h: 180 }];
+  let lastX = 80;
+  for (let i = 0; i < 120; i++) {
+    const gap = randInt(180, 280), width = randInt(110, 150), height = randInt(200, 380);
+    lastX += gap + 50;
+    buildings.push({ x: lastX, y: BASE_HEIGHT - height, w: width, h: height });
+  }
+}
+
+function spawnCharacter() {
+  const [mass, color, name, slide, base] = roster[charIdx];
+  charMass = mass; charColor = color; charName = name; charSlide = slide;
+  charSprites = getSprites(base);
+  charRadius = 36 + Math.floor(mass * 3.0);
+  const b = buildings[currentBuildingIdx];
+  charX = b.x + Math.floor(b.w / 2);
+  charY = b.y - charRadius;
+  charVx = 0; charVy = 0; restX = charX;
+  isLaunched = false; isSliding = false; currentForce = 0;
+}
+
+function startNewRun(idx) {
+  score = 0; currentBuildingIdx = 0; cameraScroll = 0; targetScroll = 0;
+  lives = 3; toast = null; predictRight = false; loadLeaderboard();
+  charIdx = idx;
+  setupBuildings();
+  spawnCharacter();
+  gameState = "PLAYING";
+}
+
+function lockPosition(b) {
+  charVx = 0; restX = charX;
+  targetScroll = b.x + Math.floor(b.w / 2) - 160;
+  currentForce = 0;
+}
+
+// ---------- input ----------
+function pos(e) {
+  const r = canvas.getBoundingClientRect();
+  return [(e.clientX - r.left) * (sw / r.width), (e.clientY - r.top) * (sh / r.height)];
+}
+function buttonBounds() {
+  const sx = sw / BASE_WIDTH, sy = sh / BASE_HEIGHT;
+  const cx = Math.floor(sw / 2);
+  const y1 = Math.floor(sh * 0.73);
+  return { cx, y1, y2: y1 + Math.floor(50 * sy), sx, sy };
+}
+canvas.addEventListener("pointerdown", (e) => {
+  const [x, y] = pos(e);
+  if (gameState === "PLAYING") {
+    if (!predictMode && !isLaunched && !isSliding) {
+      aiming = true; mx = x; my = y;
+      canvas.setPointerCapture(e.pointerId);
+    }
+  } else {
+    const { cx, y1, y2, sx, sy } = buttonBounds();
+    const ty = toggleY() * sy;
+    if (y >= ty && y <= ty + 32 * sy) {
+      if (x >= cx - 125 * sx && x <= cx - 5 * sx) { predictMode = false; loadLeaderboard(); }
+      else if (x >= cx + 5 * sx && x <= cx + 125 * sx) { predictMode = true; loadLeaderboard(); }
+    }
+    if (y >= y1 && y <= y2) {
+      if (x >= cx - 240 * sx && x <= cx - 80 * sx) startNewRun(0);
+      else if (x > cx - 80 * sx && x <= cx + 80 * sx) startNewRun(1);
+      else if (x > cx + 80 * sx && x <= cx + 240 * sx) startNewRun(2);
+    }
+  }
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (gameState === "PLAYING" && aiming) {
+    [mx, my] = pos(e);
+    const sx = sw / BASE_WIDTH, sy = sh / BASE_HEIGHT;
+    const dist = Math.hypot(mx - (charX - cameraScroll) * sx, my - charY * sy);
+    currentForce = Math.min((dist / sx) * 0.75, 200);
+  }
+});
+canvas.addEventListener("pointerup", () => {
+  if (gameState === "PLAYING" && aiming) {
+    aiming = false;
+    const sx = sw / BASE_WIDTH, sy = sh / BASE_HEIGHT;
+    const dx = mx - (charX - cameraScroll) * sx;
+    const dy = my - charY * sy;
+    const angle = Math.atan2(dy, dx);
+    const dist = Math.hypot(dx, dy);
+    const force = Math.min((dist / sx) * 0.75, 200);
+    const speed = (force / charMass) * 0.42;
+    charVx = speed * Math.cos(angle);
+    charVy = speed * Math.sin(angle);
+    isLaunched = true;
+  }
+});
+
+// ---------- predict mode ----------
+function toggleY() { return gameState === "MENU" ? 215 : 340; }
+
+// x where the ball's bottom comes DOWN through the next roof's level (game's own gravity step)
+function simLandX(speed, ang, nb) {
+  let x = charX, y = charY;
+  const vx = speed * Math.cos(ang);
+  let vy = -speed * Math.sin(ang);
+  for (let i = 0; i < 4000; i++) {
+    const prevBottom = y + charRadius;
+    vy += GRAVITY; x += vx; y += vy;
+    if (vy > 0 && prevBottom < nb.y && y + charRadius >= nb.y) return x;
+  }
+  return -1e9;
+}
+// speed that lands at the centre of the next roof, or null if this angle can't do it
+function solveSpeed(ang, nb) {
+  const target = nb.x + nb.w / 2;
+  let lo = 0.5, hi = 120;
+  for (let i = 0; i < 50; i++) {
+    const mid = (lo + hi) / 2;
+    if (simLandX(mid, ang, nb) < target) lo = mid; else hi = mid;
+  }
+  return Math.abs(simLandX(hi, ang, nb) - target) < 3 ? hi : null;
+}
+// shallowest angle (45 first, then steeper) that has a valid answer for this round
+function getRound() {
+  const nb = buildings[currentBuildingIdx + 1];
+  if (!nb) return null;
+  const key = currentBuildingIdx + ":" + Math.round(charX);
+  if (!roundCache || roundCache.key !== key) {
+    let angle = PREDICT_ANGLES[0], ideal = null;
+    for (const deg of PREDICT_ANGLES) {
+      angle = deg;
+      ideal = solveSpeed(deg * Math.PI / 180, nb);
+      if (ideal !== null) break;
+    }
+    roundCache = { key, angle, ideal };
+  }
+  return roundCache;
+}
+function predictLaunch() {
+  if (gameState !== "PLAYING" || !predictMode || isLaunched || isSliding) return;
+  const r = getRound();
+  if (!r) return;
+  const guess = parseFloat(spdEl.value);
+  const ang = r.angle * Math.PI / 180;
+  predictRight = r.ideal !== null && Math.abs(guess - r.ideal) / r.ideal <= PERFECT_TOLERANCE;
+  charVx = guess * Math.cos(ang);
+  charVy = -guess * Math.sin(ang);
+  isLaunched = true;
+}
+function missPredict() {
+  lives--;
+  score = Math.max(0, score - 1);
+  predictRight = false;
+  if (lives <= 0) { saveScore(); gameState = "GAMEOVER"; return; }
+  toast = { text: "MISSED! -1 POINT", color: "#ff3f34", t: 110 };
+  charX = restX;
+  charY = buildings[currentBuildingIdx].y - charRadius;
+  charVx = 0; charVy = 0; isLaunched = false; isSliding = false; currentForce = 0;
+}
+
+// ---------- physics ----------
+function update() {
+  if (gameState !== "PLAYING") return;
+  cameraScroll += (targetScroll - cameraScroll) * 0.08;
+  if (toast && --toast.t <= 0) toast = null;
+
+  if (isLaunched) {
+    charVy += GRAVITY;
+    charX += charVx;
+    charY += charVy;
+
+    if (charY > BASE_HEIGHT + 50 || charY < SKY_LIMIT) {
+      if (predictMode) { missPredict(); return; }
+      saveScore();
+      gameState = "GAMEOVER";
+      return;
+    }
+    for (let idx = currentBuildingIdx; idx <= Math.min(currentBuildingIdx + ACTIVE_AHEAD, buildings.length - 1); idx++) {
+      const b = buildings[idx];
+      if (b.x - 5 <= charX + charRadius && charX + charRadius <= b.x + 10) {
+        if (charY + charRadius > b.y + 10) charVx = -charVx * 0.3;
+      }
+      if (b.x <= charX && charX <= b.x + b.w) {
+        if (b.y <= charY + charRadius && charY + charRadius <= b.y + 16 && charVy > 0) {
+          charY = b.y - charRadius;
+          charVy = 0;
+          isLaunched = false;
+          if (idx > currentBuildingIdx) {
+            const gain = idx - currentBuildingIdx;
+            if (predictMode) {
+              score += predictRight ? gain * 2 : gain;
+              toast = predictRight
+                ? { text: "PERFECT! DOUBLE POINTS x2", color: "#05c46b", t: 110 }
+                : { text: "LANDED! +" + gain, color: "#ffdd59", t: 110 };
+            } else score += gain;
+            currentBuildingIdx = idx;
+          }
+          predictRight = false;
+          if (Math.abs(charVx) > 0.5 && charSlide > 0) isSliding = true;
+          else lockPosition(b);
+          break;
+        }
+      }
+    }
+  } else if (isSliding) {
+    charVx *= charSlide;
+    charX += charVx;
+    const cb = buildings[currentBuildingIdx];
+    if (!(cb.x <= charX && charX <= cb.x + cb.w)) {
+      isSliding = false;
+      isLaunched = true;
+    } else if (Math.abs(charVx) < 0.2) {
+      isSliding = false;
+      lockPosition(cb);
+    }
+  }
+}
+
+// ---------- drawing ----------
+function text(str, x, y, font, color, align = "left", base = "top") {
+  ctx.font = font; ctx.fillStyle = color;
+  ctx.textAlign = align; ctx.textBaseline = base;
+  ctx.fillText(str, x, y);
+}
+function rect(x1, y1, x2, y2, fill, stroke, lw) {
+  if (fill) { ctx.fillStyle = fill; ctx.fillRect(x1, y1, x2 - x1, y2 - y1); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw || 1; ctx.strokeRect(x1, y1, x2 - x1, y2 - y1); }
+}
+
+function drawButtons() {
+  const { cx, y1, y2, sx, sy } = buttonBounds();
+  const ty = toggleY() * sy;
+  [["CLASSIC", -125, false], ["PREDICT", 5, true]].forEach(([label, off, mode]) => {
+    const on = predictMode === mode;
+    rect(cx + off * sx, ty, cx + (off + 120) * sx, ty + 32 * sy, on ? "#ffdd59" : "rgba(0,0,0,0.45)", "white", 2);
+    text(label, cx + (off + 60) * sx, ty + 16 * sy, `bold ${Math.floor(12 * sy)}px Arial`,
+         on ? "black" : "white", "center", "middle");
+  });
+  const defs = [
+    [-240, -80, "#ff3f34", "ARACHNE (1.0kg)", "white"],
+    [-80, 80, "#05c46b", "NEMESIS (2.5kg)", "white"],
+    [80, 240, "#34e7e4", "DANGO (5.0kg)", "black"],
+  ];
+  for (const [a, b, fill, label, tc] of defs) {
+    rect(cx + a * sx, y1, cx + b * sx, y2, fill, "white", 2);
+    text(label, cx + ((a + b) / 2) * sx, (y1 + y2) / 2,
+         `bold ${Math.floor(11 * sy)}px Arial`, tc, "center", "middle");
+  }
+}
+
+function drawPredictUI(sx, sy) {
+  const playing = gameState === "PLAYING" && predictMode;
+  const show = playing && !isLaunched && !isSliding && !!buildings[currentBuildingIdx + 1];
+  panel.style.display = show ? "block" : "none";
+  if (show) {
+    const cb = buildings[currentBuildingIdx], nb = buildings[currentBuildingIdx + 1];
+    const gap = nb.x - (cb.x + cb.w), dh = cb.y - nb.y;
+    const hText = dh > 0 ? dh + " m higher" : dh < 0 ? (-dh) + " m lower" : "level";
+    infoEl.textContent = `Gap: ${gap} m | Next roof: ${hText} | Angle: ${getRound().angle}° | g = ${GRAVITY}`;
+    const v = parseFloat(spdEl.value);
+    valEl.textContent = v.toFixed(1);
+    forceEl.textContent = `${charName} needs ${(v * charMass / 0.42).toFixed(1)} N for that speed`;
+  }
+  if (playing) {
+    text("LIVES: " + "♥".repeat(Math.max(0, lives)), 25 * sx, 115 * sy,
+         `bold ${Math.floor(12 * sy)}px Arial`, "#ff3f34");
+    if (toast) text(toast.text, sw / 2, 70 * sy,
+         `${Math.floor(30 * sy)}px Impact, Arial Black, sans-serif`, toast.color, "center", "middle");
+  }
+}
+
+function draw() {
+  const sx = sw / BASE_WIDTH, sy = sh / BASE_HEIGHT;
+  ctx.clearRect(0, 0, sw, sh);
+
+  // background
+  if (bgImg.ok) ctx.drawImage(bgImg, 0, 0, sw, sh);
+  else rect(0, 0, sw, sh, "#1e272e");
+
+  // atmosphere limit
+  ctx.strokeStyle = "#ff3f34"; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+  ctx.beginPath(); ctx.moveTo(0, SKY_LIMIT * sy); ctx.lineTo(sw, SKY_LIMIT * sy); ctx.stroke();
+  ctx.setLineDash([]);
+  text("OUT OF ATMOSPHERE ZONE", sw - 15, (SKY_LIMIT + 8) * sy,
+       `bold ${Math.floor(8 * sy)}px Arial`, "#ff3f34", "right", "middle");
+
+  // buildings
+  for (let i = Math.max(0, currentBuildingIdx - 1); i <= Math.min(currentBuildingIdx + ACTIVE_AHEAD, buildings.length - 1); i++) {
+    const b = buildings[i];
+    const screenX = (b.x - cameraScroll) * sx;
+    if (screenX > -200 && screenX < sw + 200) {
+      const bw = Math.floor(b.w * sx), bh = Math.floor((BASE_HEIGHT - b.y) * sy);
+      if (buildingImg.ok) {
+        ctx.drawImage(buildingImg, screenX, b.y * sy, bw, bh);
+      } else {
+        rect(screenX, b.y * sy, screenX + bw, sh, "#485460", "#05c46b", 3);
+      }
+    }
+  }
+
+  // aiming trajectory
+  if (gameState === "PLAYING" && aiming) {
+    const scx = (charX - cameraScroll) * sx, scy = charY * sy;
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.setLineDash([4, 2]);
+    ctx.beginPath(); ctx.moveTo(scx, scy); ctx.lineTo(mx, my); ctx.stroke();
+    ctx.setLineDash([]);
+
+    let simX = charX - cameraScroll, simY = charY;
+    const dx = mx / sx - simX, dy = my / sy - simY;
+    const angle = Math.atan2(dy, dx), dist = Math.hypot(dx, dy);
+    const speed = (Math.min(dist * 0.75, 200) / charMass) * 0.42;
+    const svx = speed * Math.cos(angle);
+    let svy = speed * Math.sin(angle);
+    ctx.fillStyle = "#ffdd59";
+    for (let i = 0; i < 45; i++) {
+      svy += GRAVITY; simX += svx; simY += svy;
+      if (simY > BASE_HEIGHT || simY < SKY_LIMIT) break;
+      ctx.beginPath();
+      ctx.ellipse(simX * sx, simY * sy, 2 * sx, 2 * sy, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // character + HUD
+  if (gameState === "PLAYING") {
+    const cx = (charX - cameraScroll) * sx, cy = charY * sy;
+    const r = charRadius * sy;
+    let state = isLaunched ? "launched" : isSliding ? "landed" : (score > 0 ? "landed" : "idle");
+    const img = charSprites[state];
+    if (img && img.ok) {
+      ctx.drawImage(img, cx - r, cy - r, r * 2, r * 2);
+    } else {
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fillStyle = charColor; ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+    }
+
+    // force bar
+    const barW = Math.floor(currentForce * sx);
+    rect(sw - 250 * sx, 25 * sy, sw - 48 * sx, 45 * sy, null, "white", 2);
+    if (barW > 0) rect(sw - 248 * sx, 27 * sy, sw - 248 * sx + barW, 43 * sy, "#ffdd59");
+    text(`FORCE: ${currentForce.toFixed(1)} N`, sw - 260 * sx, 35 * sy,
+         `${Math.floor(14 * sy)}px Impact, Arial Black, sans-serif`, "#ffdd59", "right", "middle");
+
+    // gap distance
+    let distText = "Next Gap: End of Course";
+    const next = currentBuildingIdx + 1;
+    if (next < buildings.length) {
+      const cb = buildings[currentBuildingIdx], nb = buildings[next];
+      distText = `Next Gap: ${nb.x - (cb.x + cb.w)}m`;
+    }
+    text(`SCORE: ${score}`, 25 * sx, 25 * sy,
+         `${Math.floor(28 * sy)}px Impact, Arial Black, sans-serif`, "#05c46b");
+    text(`Projectile: ${charName}`, 25 * sx, 65 * sy,
+         `bold ${Math.floor(11 * sy)}px Arial`, "#fff");
+    text(distText, 25 * sx, 90 * sy, `bold ${Math.floor(10 * sy)}px Arial`, "#ffdd59");
+  }
+
+  drawPredictUI(sx, sy);
+
+  // overlays
+  const impact = (n) => `${Math.floor(n * sy)}px Impact, Arial Black, sans-serif`;
+  if (gameState === "MENU") {
+    if (!bgImg.ok) rect(0, 0, sw, sh, "#1e272e");
+    text("PRODUCED PHYSICS LAUNCHER", sw / 2, 120 * sy, impact(42), "#05c46b", "center", "middle");
+    text("SELECT YOUR PROJECTILE TO BEGIN:", sw / 2, 180 * sy,
+         `bold ${Math.floor(14 * sy)}px Arial`, "white", "center", "middle");
+    drawButtons();
+  } else if (gameState === "GAMEOVER") {
+    rect(0, 0, sw, sh, "rgba(0,0,0,0.5)");
+    text("GAME OVER", sw / 2, 80 * sy, impact(44), "#ff3f34", "center", "middle");
+    text(`YOUR SCORE: ${score}`, sw / 2, 130 * sy,
+         `bold ${Math.floor(16 * sy)}px Arial`, "white", "center", "middle");
+    text("🏆 LOCAL TOP 5 HIGH SCORES 🏆", sw / 2, 180 * sy,
+         `bold ${Math.floor(12 * sy)}px Arial`, "#ffdd59", "center", "middle");
+    let y = 210;
+    highScores.forEach((s, rank) => {
+      const prefix = rank === 0 ? "⭐ " : `${rank + 1}. `;
+      text(`${prefix}${s} Buildings Cleared`, sw / 2, y * sy,
+           `${Math.floor(11 * sy)}px Arial`, "#d2dae2", "center", "middle");
+      y += 24;
+    });
+    text("PLAY AGAIN? SELECT NEXT BALL CLASS:", sw / 2, 385 * sy,
+         `bold ${Math.floor(13 * sy)}px Arial`, "white", "center", "middle");
+    drawButtons();
+  }
+}
+
+// ---------- loop & resize ----------
+function resize() {
+  sw = canvas.width = window.innerWidth;
+  sh = canvas.height = window.innerHeight;
+}
+window.addEventListener("resize", resize);
+
+let last = performance.now(), acc = 0;
+function frame(now) {
+  acc += Math.min(now - last, 100);
+  last = now;
+  while (acc >= 16) { update(); acc -= 16; }
+  draw();
+  requestAnimationFrame(frame);
+}
+
+resize();
+loadLeaderboard();
+setupBuildings();
+requestAnimationFrame(frame);
